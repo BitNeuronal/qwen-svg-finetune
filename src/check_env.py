@@ -67,7 +67,8 @@ def main() -> int:
         print(f"Logged in as : {info.get('name', '?')}  (email: {info.get('email', '?')})")
     except Exception as e:
         print(f"No hay sesión iniciada.  ({e})")
-        print("→ Corre: huggingface-cli login")
+        print("→ Corre: hf auth login   (CLI nuevo en huggingface_hub >= 1.0)")
+        print("  Docs: https://huggingface.co/docs/huggingface_hub/v1.10.1/guides/cli")
 
     _header("bitsandbytes (opcional, solo CUDA)")
     try:
