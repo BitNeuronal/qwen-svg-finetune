@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# Hugging Face / model caches
+.cache/
+hf_cache/
+outputs/
+checkpoints/
+runs/
+wandb/
+*.safetensors
+*.bin
+
+# Logs
+*.log
+logs/
+
+# SVGs generados en pruebas locales (guardamos solo los curados)
+samples/generated/
+
+# macOS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets — NUNCA commitear
+.env
+.env.*
+*.pem
+hf_token*
