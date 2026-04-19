@@ -75,7 +75,7 @@ ds = ds.filter(is_clean)   # 4750 → 4666
 
 El segundo training usa el dataset filtrado. Mismo código, mismos hyperparams, mismos ~2h de T4. Si v2 genera SVG válido con regularidad, el pipeline queda validado.
 
-Desarrollo completo (causa raíz + diagnóstico con greedy + teoría de por qué 1.77% basta para colapsar): [Paso 5.5 del tutorial](https://bitneuronal.com/p/fine-tune-qwen-svg-trl-colab).
+Desarrollo completo (causa raíz + diagnóstico con greedy + teoría de por qué 1.77% basta para colapsar): sección *"La trampa"* en el [post del newsletter](https://bitneuronal.com/p/fine-tune-qwen-svg-trl-colab).
 
 ## Quick start: usar el adapter entrenado
 
@@ -156,7 +156,7 @@ Soportado pero **lento** (~7 min/step en M2 Max por la ausencia de cuantización
 python src/train.py --smoke  # 50 steps, ~30 min en M2 Max
 ```
 
-Detalles y los bugs específicos de MPS (NaN cascade con gradient_checkpointing) están explicados en [el tutorial completo](https://bitneuronal.com/p/fine-tune-qwen-svg-trl-colab).
+En MPS hay que desactivar `gradient_checkpointing` (causa NaN cascade con Qwen2.5). `src/train.py` lo detecta automáticamente según el device.
 
 ## Estructura del repo
 
