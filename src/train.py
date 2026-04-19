@@ -56,11 +56,13 @@ def detect_device() -> dict:
             "recommend_4bit": True,
         }
     if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        # En MPS fp16 es inestable (no hay loss scaling dinámico). Usamos bf16 nativo
+        # para evitar overflow → NaN. Requiere torch >= 2.4 en Apple Silicon.
         return {
             "name": "mps",
-            "dtype": torch.float16,
-            "bf16": False,
-            "fp16": True,
+            "dtype": torch.bfloat16,
+            "bf16": False,   # el modelo ya está cargado en bf16, no activamos autocast
+            "fp16": False,
             "recommend_4bit": False,
         }
     return {
@@ -193,7 +195,10 @@ def main() -> None:
         eval_strategy="no",
         bf16=device["bf16"],
         fp16=device["fp16"] and not use_4bit,  # cuando 4bit, compute_dtype controla
-        gradient_checkpointing=True,
+        # gradient_checkpointing: útil en CUDA para ahorrar VRAM (T4 16GB).
+        # En MPS causa NaN cascade con Qwen2.5 + LoRA (loss salta a ~85 en step ~10).
+        # Lo desactivamos en Mac; en CUDA/Colab lo mantenemos activo.
+        gradient_checkpointing=(device["name"] != "mps"),
         report_to="none",
         seed=42,
     )
