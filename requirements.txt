@@ -30,6 +30,7 @@ huggingface_hub>=0.25.0
 
 # SVG evaluación / renderizado
 cairosvg>=2.7.1
+pillow>=10.0.0       # compositing de PNGs side-by-side en eval.py
 
 # Notebook (opcional local; Colab ya lo trae)
 jupyter>=1.0.0
