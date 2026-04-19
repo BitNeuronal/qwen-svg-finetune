@@ -8,28 +8,74 @@ Parte del [Issue Semanal #2 de BitNeuronal](https://bitneuronal.com) — IA sin 
 
 🤗 **Adapter en Hugging Face**: [`bitneuronal/qwen-svg-coder-lora`](https://huggingface.co/bitneuronal/qwen-svg-coder-lora)
 
+> ⚠️ **Estado del proyecto (19 abril 2026)**: la **v1 del adapter colapsó** por contaminación del dataset base — 1.77% de las muestras (84 de 4,750) tenían `"No valid response from model."` como completion, y el fine-tune aprendió esa cadena como respuesta óptima. La **v2** está entrenando con el dataset filtrado; queda bloqueada por la cuota diaria de Colab Free. Ver ["Estado del adapter"](#estado-del-adapter-abril-2026) abajo. El código, el pipeline y la receta técnica son correctos y reutilizables — solo los números de eval del adapter actualmente publicado no son usables.
+
 ---
 
 ## ¿Qué hace este repo?
 
-Toma un modelo de lenguaje (Qwen2.5-Coder-1.5B) que "entiende" código pero **no está especializado en SVG**, y lo entrena para que, dado un prompt en inglés describiendo una imagen, devuelva código SVG bien formado y renderizable.
+Toma un modelo de lenguaje (Qwen2.5-Coder-1.5B) que "entiende" código pero **no está especializado en SVG**, y lo entrena para que, dado un prompt en inglés describiendo una imagen, devuelva código SVG bien formado y renderizable — solo 18 M parámetros nuevos en el adaptador LoRA, sin tocar los 1,500 millones del base.
 
-El modelo fine-tuned pasa de generar SVG caóticos (~15–25% renderizables) a producir SVG consistentes (~TBD% renderizables, ver tabla de resultados abajo) sin tocar los 1,500 millones de parámetros del base — solo 18 M parámetros nuevos en el adaptador LoRA.
+La parte interesante no es solo el pipeline (QLoRA 4-bit, TRL v1.0, una T4 gratis) sino también lo que salió mal: el primer adapter entrenado colapsó a una cadena basura que estaba en el 1.77% del dataset. Auditar y filtrar resuelve el problema. Todo documentado en el [tutorial](https://bitneuronal.com/p/fine-tune-qwen-svg-trl-colab).
 
 ## Resultados
 
-Evaluación sobre 5 prompts held-out del test set (`thesantatitan/deepseek-svg-dataset`). Métricas sobre el output crudo de cada modelo con `temperature=0.7`, `top_p=0.95`:
+### v1 — mode collapse (19 abril 2026)
 
-| Métrica | Base (sin fine-tune) | Adapter (fine-tuned) |
-|---|---|---|
-| Contiene bloque `<svg>` | TBD% | TBD% |
-| Well-formed XML | TBD% | TBD% |
-| Renderizable con `cairosvg` | TBD% | TBD% |
-| Tags SVG válidos | TBD% | TBD% |
+Sanity check con 5 prompts distintos (greedy + sampling a temperature=0.7 con 5 seeds):
 
-<!-- TODO: completar tabla con números reales de outputs/eval_report.md -->
+| Métrica | Adapter v1 |
+|---|---|
+| Contiene bloque `<svg>` | **0/5** |
+| Well-formed XML | **0/5** |
+| Renderizable con `cairosvg` | **0/5** |
+| Output = `"No valid response from model."` | **5/5** |
 
-Ejemplos visuales (base \| adapter \| ground truth) en [`outputs/samples/`](./outputs/samples/).
+No es azar del sampling: ante cualquier prompt, el modelo devuelve la misma cadena de 29 caracteres (ver [Estado del adapter](#estado-del-adapter-abril-2026)).
+
+### v2 — en cola
+
+Re-training con dataset filtrado (4,750 → ~4,666 muestras limpias) pendiente de cuota Colab. Los números finales se publican aquí y en la [model card del Hub](https://huggingface.co/bitneuronal/qwen-svg-coder-lora) cuando termine.
+
+Ejemplos visuales (base \| adapter v2 \| ground truth) aparecerán en [`outputs/samples/`](./outputs/samples/) junto con los números.
+
+## Estado del adapter (abril 2026)
+
+El primer training (594 steps, loss 0.91 → 0.61, ~1h 51min) **técnicamente funcionó**: el adaptador quedó guardado, loss bajó, nada crasheó. Pero cuando le pedí un SVG simple con greedy decoding me respondió:
+
+```
+No valid response from model.
+```
+
+5 seeds distintos después, idéntico. Mode collapse. Auditoría del dataset:
+
+```python
+ds = load_dataset("thesantatitan/deepseek-svg-dataset", split="train")
+bad = sum(1 for ex in ds if "No valid response from model" in ex["completion"])
+print(f"{bad}/{len(ds)}")   # → 84/4750  (1.77%)
+```
+
+Los autores del dataset usaron DeepSeek para generar las respuestas. Cuando DeepSeek fallaba, el pipeline guardó el mensaje de error literal como si fuera una completion válida. 84 muestras contaminadas.
+
+**Por qué el 1.77% colapsa al 100%**: con `assistant_only_loss=True`, la loss se concentra en los ~8 tokens del stub (vs 600–1,200 de un SVG real), el string es idéntico en las 84 muestras (atractor estable), y es trivial de memorizar (loss → 0 rápido). El optimizer encontró el atajo.
+
+**Fix** — filtrar antes de entrenar:
+
+```python
+def is_clean(ex):
+    c = ex["completion"]
+    return (
+        "No valid response from model" not in c
+        and len(c) >= 200
+        and "<svg" in c
+    )
+
+ds = ds.filter(is_clean)   # 4750 → 4666
+```
+
+El segundo training usa el dataset filtrado. Mismo código, mismos hyperparams, mismos ~2h de T4. Si v2 genera SVG válido con regularidad, el pipeline queda validado.
+
+Desarrollo completo (causa raíz + diagnóstico con greedy + teoría de por qué 1.77% basta para colapsar): [Paso 5.5 del tutorial](https://bitneuronal.com/p/fine-tune-qwen-svg-trl-colab).
 
 ## Quick start: usar el adapter entrenado
 
@@ -59,9 +105,17 @@ messages = [
     {"role": "system", "content": "Respond in the following format:\n<think>\n...\n</think>\n...\n<generated_svg>\n...\n</generated_svg>"},
     {"role": "user", "content": "Generate svg code for an image that looks like: a red circle on a blue background"},
 ]
-inputs = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_tensors="pt").to(model.device)
-output = model.generate(inputs, max_new_tokens=1024, do_sample=True, temperature=0.7, top_p=0.9)
-print(tokenizer.decode(output[0][inputs.shape[1]:], skip_special_tokens=True))
+# En transformers recientes, apply_chat_template(tokenize=True, return_tensors="pt")
+# devuelve un BatchEncoding (dict), no un tensor. Usamos el pattern de dos pasos.
+prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+output = model.generate(**inputs, max_new_tokens=1024, do_sample=True,
+                        temperature=0.7, top_p=0.9,
+                        pad_token_id=tokenizer.eos_token_id)
+output_text = tokenizer.decode(output[0][inputs["input_ids"].shape[1]:],
+                               skip_special_tokens=True)
+print(output_text)
 ```
 
 Para renderizar el SVG generado:
@@ -74,9 +128,11 @@ cairosvg.svg2png(bytestring=svg.encode(), write_to="out.png")
 
 ## Reproducir el entrenamiento
 
+> **Antes de entrenar:** auditá el dataset. El notebook y `src/train.py` aceptan un DatasetDict filtrado en `./dataset_clean/`; el tutorial explica cómo generarlo con un `filter()` de 4 líneas. Entrenar sobre el dataset público sin filtrar reproduce el mode collapse documentado arriba.
+
 **Opción A — Colab Free (recomendado, $0):**
 
-Abre [`notebooks/train_colab.ipynb`](./notebooks/train_colab.ipynb) en Colab, configura una GPU T4 (Runtime → Change runtime type → T4 GPU), y ejecuta todas las celdas. El notebook es end-to-end: instala, entrena, guarda, evalúa.
+Abre [`notebooks/train_colab.ipynb`](./notebooks/train_colab.ipynb) en Colab, configura una GPU T4 (Runtime → Change runtime type → T4 GPU), y ejecuta todas las celdas. El notebook es end-to-end: instala, filtra dataset, entrena, guarda, evalúa.
 
 **Opción B — Local con GPU NVIDIA:**
 
@@ -159,7 +215,13 @@ El 1.5B entra en la T4 con batch decente y entrena en ~2 h gratis. El mismo pipe
 Porque la T4 es Turing (compute capability 7.5) y sus Tensor Cores solo aceleran fp16. En bf16 cae a FP32 emulado y el training se vuelve 8× más lento (medido).
 
 **¿Puedo usar otro dataset?**
-Sí. Si ya viene en formato `messages` (chat), solo cambia `DATASET_ID`. Si viene como pares `{prompt, completion}`, hay que convertirlo a `messages` (ver [`src/format_dataset.py`](./src/format_dataset.py)).
+Sí. Si ya viene en formato `messages` (chat), solo cambia `DATASET_ID`. Si viene como pares `{prompt, completion}`, hay que convertirlo a `messages` (ver [`src/format_dataset.py`](./src/format_dataset.py)). **Y audítalo antes de entrenar** — el mismo `is_clean()` funciona como plantilla: ajusta los predicados al formato de tu dataset específico.
+
+**¿Cómo sé si mi modelo fine-tuneado tiene mode collapse?**
+Post-training, antes de cualquier eval formal, corre un sanity check de 30 segundos: 3 prompts distintos, greedy decoding (`do_sample=False`). Si los 3 outputs son idénticos (o casi), o si todos son extremadamente cortos (<100 chars), hay colapso. La causa más común es contaminación del dataset con respuestas de fallo del pipeline que generó los datos. `src/eval.py --temperature 0 --n_samples 3` hace exactamente eso.
+
+**¿El adapter del Hub funciona o no?**
+En el momento de escribir esto (abril 2026): **no**. El commit actual es v1 con mode collapse. v2 con dataset filtrado está en cola; cuando se publique, la model card del Hub y esta sección quedarán actualizadas con los números reales.
 
 ## Contribuir
 
