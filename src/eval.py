@@ -26,6 +26,19 @@ Uso:
     # Solo evalúa el adapter (más rápido, sin comparación)
     python src/eval.py --skip-baseline
 
+    # Evalúa contra el dataset limpio local (recomendado si entrenaste con filtro)
+    python src/eval.py --dataset_path ./dataset_clean
+
+    # Greedy determinista (útil para sanity checks post-training)
+    python src/eval.py --temperature 0 --n_samples 3
+
+Notas:
+    - El script filtra muestras contaminadas ("No valid response from model",
+      completions < 200 chars, o sin bloque <svg>) antes de samplear, para
+      que el reporte no se ensucie con ground-truths basura.
+    - Si el dataset no tiene split 'test', crea uno 95/5 desde 'train' con el
+      mismo seed para que el eval sea reproducible run-a-run.
+
 Requiere:
     - GPU CUDA con bitsandbytes (carga el base en 4-bit) O
     - MPS/CPU con fp16/fp32 (sin cuantización; más RAM/más lento).
@@ -40,7 +53,7 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import torch
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 MODEL_ID = "Qwen/Qwen2.5-Coder-1.5B-Instruct"
@@ -96,6 +109,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--skip-baseline", dest="skip_baseline", action="store_true",
                    help="Solo evalúa el adapter, no genera con base.")
     p.add_argument("--quant", choices=["auto", "4bit", "none"], default="auto")
+    p.add_argument("--dataset_path", default=None,
+                   help="Si se da, carga un DatasetDict local (ej: ./dataset_clean). "
+                        "Si no, carga el dataset público del Hub.")
+    p.add_argument("--dataset_id", default=DATASET_ID,
+                   help="Dataset ID en HuggingFace Hub (solo si --dataset_path no se usa).")
+    p.add_argument("--dataset_split", default="test",
+                   help="Split a usar. Si no existe, cae a 'train' + split 5%% local.")
     return p.parse_args()
 
 
@@ -215,6 +235,65 @@ def sidebyside(paths: list[Path | None], labels: list[str], out: Path) -> None:
     for i, panel in enumerate(panels):
         combined.paste(panel, (i * (W + PAD), 0))
     combined.save(out)
+
+
+# -----------------------------------------------------------------
+# Carga del dataset (local o Hub, con fallback y filtro)
+# -----------------------------------------------------------------
+
+def _is_clean_sample(ex: dict) -> bool:
+    """Descarta muestras donde la completion es stub, demasiado corta, o sin SVG."""
+    c = ex.get("completion", "") or ""
+    if "No valid response from model" in c:
+        return False
+    if len(c) < 200:
+        return False
+    if "<svg" not in c:
+        return False
+    return True
+
+
+def load_eval_dataset(args: argparse.Namespace):
+    """Devuelve un `Dataset` con las muestras sobre las que evaluar.
+
+    Orden de preferencia:
+      1. --dataset_path (local DatasetDict) → usa args.dataset_split; si no existe,
+         hace train_test_split 95/5 sobre 'train' con args.seed.
+      2. HF Hub (args.dataset_id) → intenta args.dataset_split; si no existe,
+         lo mismo.
+    En ambos casos filtra muestras contaminadas antes de devolver.
+    """
+    if args.dataset_path:
+        print(f"\n=== Dataset local: {args.dataset_path} ===")
+        ds = load_from_disk(args.dataset_path)
+        available = list(ds.keys()) if hasattr(ds, "keys") else ["<single>"]
+        print(f"  splits disponibles: {available}")
+    else:
+        print(f"\n=== Dataset Hub: {args.dataset_id} ===")
+        ds = load_dataset(args.dataset_id)
+        available = list(ds.keys())
+        print(f"  splits disponibles: {available}")
+
+    # Resuelve split — con fallback a train + split 5%
+    if args.dataset_split in ds:
+        eval_split = ds[args.dataset_split]
+        print(f"  usando split '{args.dataset_split}' ({len(eval_split)} muestras)")
+    elif "train" in ds:
+        print(f"  split '{args.dataset_split}' no existe; creando test 5% desde 'train'")
+        s = ds["train"].train_test_split(test_size=0.05, seed=args.seed)
+        eval_split = s["test"]
+        print(f"  test derivado: {len(eval_split)} muestras")
+    else:
+        sys.exit(f"ERROR: ni '{args.dataset_split}' ni 'train' disponibles en el dataset.")
+
+    # Filtra muestras contaminadas para que el eval no compare contra basura
+    before = len(eval_split)
+    eval_split = eval_split.filter(_is_clean_sample)
+    dropped = before - len(eval_split)
+    if dropped > 0:
+        print(f"  filtradas {dropped} muestras contaminadas "
+              f"({100*dropped/before:.1f}%) → {len(eval_split)} limpias")
+    return eval_split
 
 
 # -----------------------------------------------------------------
@@ -392,20 +471,23 @@ def main() -> None:
     model = PeftModel.from_pretrained(model, args.adapter_path)
     model.eval()
 
-    # Sample indices del test set
-    print(f"\n=== Dataset: {DATASET_ID} (split=test) ===")
-    ds = load_dataset(DATASET_ID, split="test")
+    # Carga del eval set (con filtro de contaminación, fallback de splits)
+    eval_split = load_eval_dataset(args)
+    if len(eval_split) < args.n_samples:
+        sys.exit(f"ERROR: eval_split tiene {len(eval_split)} muestras, "
+                 f"se pidieron {args.n_samples}.")
+
     rng = torch.Generator().manual_seed(args.seed)
-    perm = torch.randperm(len(ds), generator=rng).tolist()
+    perm = torch.randperm(len(eval_split), generator=rng).tolist()
     sample_idxs = perm[:args.n_samples]
     print(f"  Sampled idxs (seed={args.seed}): {sample_idxs}")
 
     # Loop
     results = []
     for i, idx in enumerate(sample_idxs):
-        print(f"\n--- Sample {i+1}/{args.n_samples} (test idx {idx}) ---")
+        print(f"\n--- Sample {i+1}/{args.n_samples} (eval idx {idx}) ---")
         sample_dir = out_dir / f"{i:02d}"
-        r = run_sample(model, tokenizer, ds[idx]["messages"], sample_dir,
+        r = run_sample(model, tokenizer, eval_split[idx]["messages"], sample_dir,
                        args, args.skip_baseline)
         r["idx"] = idx
         results.append(r)
